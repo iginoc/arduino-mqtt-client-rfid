@@ -40,6 +40,10 @@ byte webMsgCode = 0;
 char lastRfidUid[16] = "";
 unsigned long lastRfidTime = 0;
 
+// Variabili per scrittura dati su RFID
+char dataToWrite[32] = "";
+byte writeMode = 0; // 0=off, 1=waiting to write
+
 void writeConfig() {
   mqttConfig.magic = CONFIG_MAGIC;
   EEPROM.put(EEPROM_ADDR, mqttConfig);
@@ -62,7 +66,7 @@ void connectToMqtt() {
   const char* user = (strlen(mqttConfig.user) > 0) ? mqttConfig.user : NULL;
   const char* pass = (strlen(mqttConfig.pass) > 0) ? mqttConfig.pass : NULL;
   if (mqttClient.connect("ArduinoDisplayClient", user, pass)) {
-    mqttClient.subscribe(mqttConfig.topic);
+    Serial.println(F("Connected to MQTT"));
   }
 }
 
@@ -75,6 +79,65 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 // RFID Functions
+void writeDataToCard(String data) {
+  // Prepara il buffer con i dati da scrivere (16 byte per blocco)
+  byte dataBlock[16];
+  memset(dataBlock, 0, 16);
+  
+  // Copia i dati nel buffer (max 15 caratteri)
+  if (data.length() > 15) data = data.substring(0, 15);
+  for (size_t i = 0; i < data.length(); i++) {
+    dataBlock[i] = data[i];
+  }
+  
+  // Ferma qualsiasi comunicazione precedente
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+  delay(50);
+  
+  // Verifica se c'è di nuovo una carta (rilettura)
+  if (!mfrc522.PICC_IsNewCardPresent()) {
+    Serial.println(F("Card removed"));
+    return;
+  }
+  
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    Serial.println(F("Cannot read card again"));
+    return;
+  }
+  
+  // Usa la chiave di default FFFFFFFFFFFF
+  MFRC522::MIFARE_Key key;
+  for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+  
+  Serial.println(F("Auth attempt on block 1..."));
+  
+  // Autentica il blocco 1 (settore 0, blocco 1)
+  MFRC522::StatusCode status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 1, &key, &(mfrc522.uid));
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print(F("Auth failed: "));
+    Serial.println(mfrc522.GetStatusCodeName(status));
+    mfrc522.PCD_StopCrypto1();
+    mfrc522.PICC_HaltA();
+    return;
+  }
+  
+  Serial.println(F("Auth OK, writing to block 1..."));
+  
+  // Scrive nel blocco 1
+  status = mfrc522.MIFARE_Write(1, dataBlock, 16);
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print(F("Write failed: "));
+    Serial.println(mfrc522.GetStatusCodeName(status));
+  } else {
+    Serial.println(F("Data written successfully"));
+  }
+  
+  // Ferma la lettura e cripto
+  mfrc522.PCD_StopCrypto1();
+  mfrc522.PICC_HaltA();
+}
+
 void handleRfidCard() {
   // Verifica se c'è una nuova card
   if (!mfrc522.PICC_IsNewCardPresent()) {
@@ -100,8 +163,18 @@ void handleRfidCard() {
   uidStr.toCharArray(lastRfidUid, sizeof(lastRfidUid));
   lastRfidTime = millis();
 
-  if (mqttClient.connected()) {
-    mqttClient.publish("arduino/rfid", uidStr.c_str());
+  // Se è in modalità scrittura, scrivi i dati
+  if (writeMode == 1 && dataToWrite[0] != '\0') {
+    Serial.print(F("Writing to card: "));
+    Serial.println(dataToWrite);
+    writeDataToCard(String(dataToWrite));
+    writeMode = 0;
+    memset(dataToWrite, 0, sizeof(dataToWrite));
+  } else {
+    // Altrimenti pubblica l'UID
+    if (mqttClient.connected()) {
+      mqttClient.publish("arduino/rfid", uidStr.c_str());
+    }
   }
 
   // Ferma la lettura
@@ -145,7 +218,40 @@ void handleClient() {
   }
   webMsgCode = 0; // Resetta messaggio
 
-  // Endpoint AJAX per leggere solo il valore MQTT
+  // Endpoint per scrivere dati su RFID
+  if (requestLine.indexOf("GET /write-rfid") == 0) {
+    int start = requestLine.indexOf("data=");
+    if (start != -1) {
+      start += 5;
+      int end = requestLine.indexOf("&", start);
+      if (end == -1) end = requestLine.indexOf(" ", start);
+      String data = requestLine.substring(start, end);
+      // Decodifica URL
+      data.replace("%20", " ");
+      data.replace("+", " ");
+      
+      if (data.length() > 0) {
+        data.toCharArray(dataToWrite, sizeof(dataToWrite));
+        writeMode = 1;
+        webMsgCode = 3; // In attesa di scrivere
+      }
+    }
+    
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: text/plain"));
+    client.println(F("Connection: close"));
+    client.println();
+    if (dataToWrite[0] != '\0') {
+      client.println(F("Ready to write. Present an NFC tag."));
+    } else {
+      client.println(F("No data provided"));
+    }
+    delay(1);
+    client.stop();
+    return;
+  }
+
+  webMsgCode = 0; // Resetta messaggio
   if (requestLine.indexOf("GET /read-mqtt") == 0) {
     client.println(F("HTTP/1.1 200 OK"));
     client.println(F("Content-Type: text/plain"));
@@ -179,7 +285,6 @@ void handleClient() {
     String usr = "";
     String pw = "";
     String portStr = "";
-    String topicStr = "";
 
     int start = requestLine.indexOf("server=");
     if (start != -1) {
@@ -219,23 +324,10 @@ void handleClient() {
       portStr = requestLine.substring(start, end);
     }
 
-    start = requestLine.indexOf("topic=");
-    if (start != -1) {
-      start += 6;
-      int end = requestLine.indexOf("&", start);
-      if (end == -1) end = requestLine.indexOf(" ", start);
-      topicStr = requestLine.substring(start, end);
-      topicStr.replace("%20", " ");
-      topicStr.replace("+", " ");
-      topicStr.replace("%2F", "/");
-      topicStr.replace("%2f", "/");
-    }
-
     if (srv.length() > 0) {
       srv.toCharArray(mqttConfig.server, sizeof(mqttConfig.server));
       usr.toCharArray(mqttConfig.user, sizeof(mqttConfig.user));
       pw.toCharArray(mqttConfig.pass, sizeof(mqttConfig.pass));
-      if (topicStr.length() > 0) topicStr.toCharArray(mqttConfig.topic, sizeof(mqttConfig.topic));
       int port = 1883;
       if (portStr.length() > 0) port = portStr.toInt();
       mqttConfig.port = port;
@@ -250,24 +342,38 @@ void handleClient() {
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: text/html"));
   client.println(F("Connection: close\n"));
-  client.println(F("<html><body><h2>Setup</h2>"));
-  if (webMsgCode == 1) client.println(F("<p style=color:green>Saved</p>"));
-  if (webMsgCode == 2) client.println(F("<p style=color:red>No server</p>"));
-  client.println(F("<form action=/mqtt method=get>"));
-  client.print(F("<input name=server value=\"")); client.print(mqttConfig.server); client.println(F("\" placeholder=Server>"));
+  client.println(F("<html><head><style>input,button{padding:4px;margin:3px}</style></head><body style=font-size:14px><h2>RFID</h2>"));
+  if (webMsgCode == 1) client.println(F("<p style=color:green>✓ MQTT OK</p>"));
+  if (webMsgCode == 2) client.println(F("<p style=color:red>✗ No server</p>"));
+  if (webMsgCode == 3) client.println(F("<p style=color:blue>⧐ Write mode ON</p>"));
+  
+  client.println(F("<h3>MQTT</h3><form action=/mqtt>"));
+  client.print(F("<input name=server value=\"")); client.print(mqttConfig.server); client.println(F("\" placeholder=Server size=20>"));
   client.print(F("<input name=user value=\"")); client.print(mqttConfig.user); client.println(F("\" placeholder=User>"));
   client.println(F("<input name=pass type=password placeholder=Pass>"));
-  client.print(F("<input name=port value=")); client.print(mqttConfig.port); client.println(F(" size=4>"));
-  client.println(F("<input type=submit></form>"));
-  client.print(F("<p>Status: "));
-  client.println(mqttClient.connected() ? F("OK</p>") : F("Disc</p>"));
-  client.print(F("<p>UID: "));
+  client.print(F("<input name=port value=")); client.print(mqttConfig.port); client.println(F(" size=3>"));
+  client.println(F("<input type=submit value=Save></form>"));
+  
+  client.println(F("<h3>Write NFC</h3><form action=/write-rfid>"));
+  client.println(F("<input name=data maxlength=15 placeholder='Text (max 15)' required>"));
+  client.println(F("<input type=submit value=Write></form>"));
+  
+  client.println(F("<h3>Status</h3>"));
+  client.print(F("MQTT: ")); client.println(mqttClient.connected() ? F("✓<br>") : F("✗<br>"));
+  client.print(F("UID: ")); 
   if (lastRfidUid[0]) {
-    client.print(lastRfidUid);
+    client.println(lastRfidUid);
   } else {
-    client.print(F("---"));
+    client.println(F("---"));
   }
-  client.println(F("</p><a href=/mqtt-test><button>Test</button></a></body></html>"));
+  client.println(F("<br>"));
+  client.print(F("Write: ")); 
+  if (writeMode == 1) {
+    client.print(F("✓ ")); client.print(dataToWrite);
+  } else {
+    client.print(F("✗"));
+  }
+  client.println(F("<br><p><a href=/mqtt-test><button>MQTT Test</button></a></p></body></html>"));
 
   delay(1);
   client.stop();
